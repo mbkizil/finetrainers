@@ -275,7 +275,7 @@ class VideoFileCaptionFileListDataset(
     def __init__(self, root: str, infinite: bool = False) -> None:
         super().__init__()
 
-        VALID_CAPTION_FILES = ["caption.txt", "captions.txt", "prompt.txt", "prompts.txt"]
+        VALID_CAPTION_FILES = ["prompt.txt", "prompts.txt", "caption.txt", "captions.txt"]
         VALID_VIDEO_FILES = ["video.txt", "videos.txt"]
 
         self.root = pathlib.Path(root)
@@ -304,18 +304,19 @@ class VideoFileCaptionFileListDataset(
 
         caption_file = existing_caption_files[0]
         video_file = existing_video_files[0]
-
         with open((self.root / caption_file).as_posix(), "r") as f:
             captions = f.read().splitlines()
         with open((self.root / video_file).as_posix(), "r") as f:
             videos = f.read().splitlines()
             videos = [(self.root / video).as_posix() for video in videos]
+            optical_flows = [(self.root / video.replace(".mp4", "_flows/optical_flows")).as_posix() for video in videos]
+            #print(videos[0], optical_flows[0])
 
         if len(captions) != len(videos):
             raise ValueError(f"Number of captions ({len(captions)}) must match number of videos ({len(videos)})")
 
-        for caption, video in zip(captions, videos):
-            data.append({"caption": caption, "video": video})
+        for caption, video, optical_flow in zip(captions, videos, optical_flows):
+            data.append({"caption": caption, "video": video, "optical_flow": optical_flow})
 
         data = datasets.Dataset.from_list(data)
         data = data.cast_column("video", datasets.Video())
@@ -334,6 +335,9 @@ class VideoFileCaptionFileListDataset(
             for sample in self._get_data_iter():
                 self._sample_index += 1
                 sample["video"] = _preprocess_video(sample["video"])
+                sample["optical_flow"] = _load_optical_flows(sample["optical_flow"]) 
+                if sample["optical_flow"] is None:
+                    _ = sample.pop("optical_flow")
                 yield sample
 
             if not self.infinite:
@@ -348,6 +352,23 @@ class VideoFileCaptionFileListDataset(
     def state_dict(self):
         return {"sample_index": self._sample_index}
 
+def _load_optical_flows(flow_folder_path: str) -> Optional[torch.Tensor]:
+    flow_folder = pathlib.Path(flow_folder_path)
+    if not flow_folder.exists():
+        logger.warning(f"Optical flow folder not found: {flow_folder}")
+        return None
+
+    frames = []
+    for i in range(49):  # 0.jpg to 50.jpg
+        path = flow_folder /  f"{i:05d}.jpg"
+        image = PIL.Image.open(path).convert("RGB")
+        tensor = _preprocess_image(image)  # shape [3, H, W]
+        frames.append(tensor)
+
+    if len(frames) == 0:
+        logger.warning(f"No optical flow frames found in {flow_folder}")
+        return None
+    return torch.stack(frames)  # shape [N, 3, H, W]
 
 class ImageFolderDataset(torch.utils.data.IterableDataset, torch.distributed.checkpoint.stateful.Stateful):
     def __init__(self, root: str, infinite: bool = False) -> None:
@@ -720,6 +741,13 @@ class IterableDatasetPreprocessingWrapper(
                     sample["video"], _first_frame_only = FF.resize_to_nearest_bucket_video(
                         sample["video"], self.video_resolution_buckets, self.reshape_mode
                     )
+                    if "optical_flow" in sample.keys():
+                        sample["optical_flow"], _ = FF.resize_to_nearest_bucket_video(
+                            sample["optical_flow"], self.video_resolution_buckets, self.reshape_mode
+                        )
+                        sample["video"] = torch.cat(
+                            (sample["video"], sample["optical_flow"]), dim=1
+                        )
                     if _first_frame_only:
                         msg = (
                             "The number of frames in the video is less than the minimum bucket size "
@@ -831,7 +859,8 @@ def _initialize_local_dataset(dataset_name_or_root: str, dataset_type: str, infi
     supported_metadata_files = ["metadata.json", "metadata.jsonl", "metadata.csv"]
     metadata_files = [root / metadata_file for metadata_file in supported_metadata_files]
     metadata_files = [metadata_file for metadata_file in metadata_files if metadata_file.exists()]
-
+    if len(metadata_files) == 0:
+        print("No metadata file found. Assuming the dataset is in a folder structure.")
     if len(metadata_files) > 1:
         raise ValueError("Found multiple metadata files. Please ensure there is only one metadata file.")
 
