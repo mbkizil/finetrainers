@@ -7,9 +7,9 @@ from diffusers import (
     AutoencoderKLWan,
     FlowMatchEulerDiscreteScheduler,
     WanImageToVideoPipeline,
-    WanPipeline,
-    WanTransformer3DModel,
 )
+from .transformerMotion import WanTransformer3DModel
+from .pipelineMotion import WanPipeline
 from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
 from PIL.Image import Image
 from transformers import AutoModel, AutoTokenizer, UMT5EncoderModel
@@ -58,24 +58,60 @@ class WanLatentEncodeProcessor(ProcessorMixin):
         assert video.ndim == 5, f"Expected 5D tensor, got {video.ndim}D tensor"
         video = video.to(device=device, dtype=vae.dtype)
         video = video.permute(0, 2, 1, 3, 4).contiguous()  # [B, F, C, H, W] -> [B, C, F, H, W]
+        if video.shape[1] == 6:
+            video, flows = video.chunk(2, dim=1)
+            print(f"\n\n Dtype: {video.dtype}, device: {video.device}, vae_dtype: {vae.dtype}, vae_device: {vae.device}")
+            print(f"video shape: {video.shape}, mean: {video.mean()}, std: {video.std()}")
+            print(f"flows shape: {flows.shape}, mean: {flows.mean()}, std: {flows.std()}")
+            if compute_posterior:
+                latents = vae.encode(video).latent_dist.sample(generator=generator)
+                latents = latents.to(dtype=dtype)
+                motion_latents = vae.encode(flows).latent_dist.sample(generator=generator)
+                motion_latents = motion_latents.to(dtype=dtype)
+                print(f"\nif latents shape: {latents.shape}, mean: {latents.mean()}, std: {latents.std()}")
+                print(f"if motion_latents shape: {motion_latents.shape}, mean: {motion_latents.mean()}, std: {motion_latents.std()}")
+            else:
+                # TODO(aryan): refactor in diffusers to have use_slicing attribute
+                # if vae.use_slicing and video.shape[0] > 1:
+                #     encoded_slices = [vae._encode(x_slice) for x_slice in video.split(1)]
+                #     moments = torch.cat(encoded_slices)
+                # else:
+                #     moments = vae._encode(video)
+                moments = vae._encode(video)
+                print(f"moments shape: {moments.shape}, mean: {moments.mean()}, std: {moments.std()}, dtype: {moments.dtype}, device: {moments.device}")
+                latents = moments.to(dtype=dtype)
+                motion_moments = vae._encode(flows)
+                print(f"motion_moments shape: {motion_moments.shape}, mean: {motion_moments.mean()}, std: {motion_moments.std()}, dtype: {motion_moments.dtype}, device: {motion_moments.device}")
+                motion_latents = motion_moments.to(dtype=dtype)
+                print(f"\nelse latents shape: {latents.shape}, mean: {latents.mean()}, std: {latents.std()}")
+                print(f"else motion_latents shape: {motion_latents.shape}, mean: {motion_latents.mean()}, std: {motion_latents.std()}")
 
-        if compute_posterior:
-            latents = vae.encode(video).latent_dist.sample(generator=generator)
-            latents = latents.to(dtype=dtype)
+            latents_mean = torch.tensor(vae.config.latents_mean)
+            latents_std = 1.0 / torch.tensor(vae.config.latents_std)
+
+
+            return {self.output_names[0]: latents, self.output_names[1]: latents_mean, self.output_names[2]: latents_std, \
+                    self.output_names[0]+"_flows": motion_latents}
+        
         else:
-            # TODO(aryan): refactor in diffusers to have use_slicing attribute
-            # if vae.use_slicing and video.shape[0] > 1:
-            #     encoded_slices = [vae._encode(x_slice) for x_slice in video.split(1)]
-            #     moments = torch.cat(encoded_slices)
-            # else:
-            #     moments = vae._encode(video)
-            moments = vae._encode(video)
-            latents = moments.to(dtype=dtype)
+            if compute_posterior:
+                latents = vae.encode(video).latent_dist.sample(generator=generator)
+                latents = latents.to(dtype=dtype)
+            else:
+                # TODO(aryan): refactor in diffusers to have use_slicing attribute
+                # if vae.use_slicing and video.shape[0] > 1:
+                #     encoded_slices = [vae._encode(x_slice) for x_slice in video.split(1)]
+                #     moments = torch.cat(encoded_slices)
+                # else:
+                #     moments = vae._encode(video)
+                moments = vae._encode(video)
+                latents = moments.to(dtype=dtype)
 
-        latents_mean = torch.tensor(vae.config.latents_mean)
-        latents_std = 1.0 / torch.tensor(vae.config.latents_std)
+            latents_mean = torch.tensor(vae.config.latents_mean)
+            latents_std = 1.0 / torch.tensor(vae.config.latents_std)
 
-        return {self.output_names[0]: latents, self.output_names[1]: latents_mean, self.output_names[2]: latents_std}
+            return {self.output_names[0]: latents, self.output_names[1]: latents_mean, self.output_names[2]: latents_std}
+
 
 
 class WanModelSpecification(ModelSpecification):
@@ -275,12 +311,19 @@ class WanModelSpecification(ModelSpecification):
         **kwargs,
     ) -> Tuple[torch.Tensor, ...]:
         compute_posterior = False  # See explanation in prepare_latents
+        
         if compute_posterior:
             latents = latent_model_conditions.pop("latents")
+            motion_latents = latent_model_conditions.pop("latents_flows")
         else:
+            print(latent_model_conditions.keys())
             latents = latent_model_conditions.pop("latents")
             latents_mean = latent_model_conditions.pop("latents_mean")
             latents_std = latent_model_conditions.pop("latents_std")
+
+            motion_latents = latent_model_conditions.pop("latents_flows")
+            print(f"\nmotion_latents shape: {motion_latents.shape}, mean: {motion_latents.mean()}, std: {motion_latents.std()}")
+            print(f"latents shape: {latents.shape}, mean: {latents.mean()}, std: {latents.std()}\n")
 
             mu, logvar = torch.chunk(latents, 2, dim=1)
             mu = self._normalize_latents(mu, latents_mean, latents_std)
@@ -291,21 +334,36 @@ class WanModelSpecification(ModelSpecification):
             latents = posterior.sample(generator=generator)
             del posterior
 
+            mu, logvar = torch.chunk(motion_latents, 2, dim=1)
+            mu = self._normalize_latents(mu, latents_mean, latents_std)
+            logvar = self._normalize_latents(logvar, latents_mean, latents_std)
+            motion_latents = torch.cat([mu, logvar], dim=1)
+
+            posterior = DiagonalGaussianDistribution(motion_latents)
+            motion_latents = posterior.sample(generator=generator)
+            del posterior
+
         noise = torch.zeros_like(latents).normal_(generator=generator)
         noisy_latents = FF.flow_match_xt(latents, noise, sigmas)
         timesteps = (sigmas.flatten() * 1000.0).long()
 
-        latent_model_conditions["hidden_states"] = noisy_latents.to(latents)
+        noise_flows = torch.zeros_like(motion_latents).normal_(generator=generator)
+        noisy_latents_flows = FF.flow_match_xt(motion_latents, noise_flows, sigmas)
+        timesteps_flows = (sigmas.flatten() * 1000.0).long()
 
-        pred = transformer(
+        latent_model_conditions["hidden_states"] = noisy_latents.to(latents)
+        latent_model_conditions["motion_latents"] = noisy_latents_flows.to(motion_latents)
+
+        pred, motion_pred = transformer(
             **latent_model_conditions,
             **condition_model_conditions,
             timestep=timesteps,
             return_dict=False,
-        )[0]
+        )
         target = FF.flow_match_target(noise, latents)
+        target_flows = FF.flow_match_target(noise_flows, motion_latents)
 
-        return pred, target, sigmas
+        return pred, target, sigmas, motion_pred, target_flows
 
     def validation(
         self,
@@ -330,12 +388,14 @@ class WanModelSpecification(ModelSpecification):
             "num_frames": num_frames,
             "num_inference_steps": num_inference_steps,
             "generator": generator,
-            "return_dict": True,
-            "output_type": "pil",
+            "return_dict": False,
+            "output_type": "np",
         }
         generation_kwargs = get_non_null_items(generation_kwargs)
-        video = pipeline(**generation_kwargs).frames[0]
-        return [VideoArtifact(value=video)]
+        video, motion_video = pipeline(**generation_kwargs)
+        video = video[0]
+        motion_video = motion_video[0]
+        return [VideoArtifact(value=video), VideoArtifact(value=motion_video)]
 
     def _save_lora_weights(
         self,
