@@ -11,7 +11,6 @@ import diffusers
 import torch
 import torch.backends
 import transformers
-import wandb
 from diffusers import DiffusionPipeline
 from diffusers.hooks import apply_layerwise_casting
 from diffusers.training_utils import cast_training_params
@@ -19,7 +18,7 @@ from diffusers.utils import export_to_video
 from huggingface_hub import create_repo, upload_folder
 from peft import LoraConfig, get_peft_model_state_dict
 from tqdm import tqdm
-
+import wandb
 from finetrainers import data, logging, optimizer, parallel, patches, utils
 from finetrainers.config import TrainingType
 from finetrainers.state import State, TrainState
@@ -43,6 +42,7 @@ class SFTTrainer:
 
     def __init__(self, args: "BaseArgs", model_specification: "ModelSpecification") -> None:
         self.args = args
+        print(f"\n SFT Trainer args: {args}")
         self.state = State()
         self.state.train_state = TrainState()
 
@@ -268,7 +268,7 @@ class SFTTrainer:
             dataset_file = config.pop("dataset_file", None)
             dataset_type = config.pop("dataset_type")
             caption_options = config.pop("caption_options", {})
-
+            print("DATASET FILE: ", dataset_file, "DATA ROOT: ", data_root, "DATASET TYPE: ", dataset_type, "CAPTION OPTIONS: ", caption_options)
             if data_root is not None and dataset_file is not None:
                 raise ValueError("Both data_root and dataset_file cannot be provided in the same dataset config.")
 
@@ -294,6 +294,7 @@ class SFTTrainer:
 
         self.dataset = dataset
         self.dataloader = dataloader
+
 
     def _prepare_checkpointing(self) -> None:
         parallel_backend = self.state.parallel_backend
@@ -331,7 +332,7 @@ class SFTTrainer:
 
     def _train(self) -> None:
         logger.info("Starting training")
-
+        wandb.init(project="WAN-AI")
         parallel_backend = self.state.parallel_backend
         train_state = self.state.train_state
         device = parallel_backend.device
@@ -385,8 +386,9 @@ class SFTTrainer:
 
         self.transformer.train()
         data_iterator = iter(self.dataloader)
-
-        preprocessor = data.initialize_preprocessor(
+        print("\n\niterator check\n\n")
+        print("item: ", next(data_iterator))
+        self.preprocessor = data.initialize_preprocessor(
             rank=parallel_backend.rank,
             num_items=self.args.precomputation_items if self.args.enable_precomputation else 1,
             processor_fn={
@@ -404,13 +406,16 @@ class SFTTrainer:
             batch_size=self.args.batch_size, dim_keys=self.model_specification._resolution_dim_keys
         )
         requires_gradient_step = True
+        accumulated_total_loss = 0.0
         accumulated_loss = 0.0
+        accumulated_motion_loss = 0.0
+        self.just_validated = False
 
         while (
             train_state.step < self.args.train_steps and train_state.observed_data_samples < self.args.max_data_samples
         ):
             # 1. Load & preprocess data if required
-            if preprocessor.requires_data:
+            if self.preprocessor.requires_data or self.just_validated:
                 # TODO(aryan): We should do the following here:
                 # - Force checkpoint the trainable models, optimizers, schedulers and train state
                 # - Do the precomputation
@@ -418,7 +423,7 @@ class SFTTrainer:
                 # This way we can be more memory efficient again, since the latest rewrite of precomputation removed
                 # this logic.
                 precomputed_condition_iterator, precomputed_latent_iterator = self._prepare_data(
-                    preprocessor, data_iterator
+                    self.preprocessor, data_iterator
                 )
 
             # 2. Prepare batch
@@ -441,10 +446,12 @@ class SFTTrainer:
             else:
                 continue
 
+
             train_state.step += 1
             train_state.observed_data_samples += self.args.batch_size * parallel_backend._dp_degree
 
             lmc_latents = latent_model_conditions["latents"]
+            print("LATENTS SHAPE: ", lmc_latents.shape)
             # TODO(aryan): observed_num_tokens this needs to be allreduced
             train_state.observed_num_tokens += math.prod(lmc_latents.shape[:-1]) // patch_size
 
@@ -470,7 +477,7 @@ class SFTTrainer:
             )
             sigmas = utils.expand_tensor_dims(sigmas, latent_model_conditions["latents"].ndim)
 
-            pred, target, sigmas = self.model_specification.forward(
+            pred, target, sigmas, motion_pred, target_flows = self.model_specification.forward(
                 transformer=self.transformer,
                 scheduler=self.scheduler,
                 condition_model_conditions=condition_model_conditions,
@@ -488,16 +495,30 @@ class SFTTrainer:
             )
             weights = utils.expand_tensor_dims(weights, pred.ndim)
 
+
+
             # 4. Compute loss & backward pass
             loss = weights.float() * (pred.float() - target.float()).pow(2)
+            motion_loss = weights.float() * (motion_pred.float() - target_flows.float()).pow(2)
+
+            assert torch.all(torch.isfinite(loss)), f"NaN in total_loss at step {train_state.step}"
+            assert torch.all(torch.isfinite(pred)), "NaN in model output"
+            assert torch.all(torch.isfinite(motion_loss)), "NaN in motion loss"
+            assert torch.all(torch.isfinite(motion_pred)), "NaN in motion model output"
             # Average loss across all but batch dimension
             loss = loss.mean(list(range(1, loss.ndim)))
+            motion_loss = motion_loss.mean(list(range(1, motion_loss.ndim)))
             # Average loss across batch dimension
             loss = loss.mean()
+            motion_loss = motion_loss.mean()
+
+            total_loss = loss + motion_loss
             if self.args.gradient_accumulation_steps > 1:
-                loss = loss / self.args.gradient_accumulation_steps
-            loss.backward()
+                total_loss = total_loss / self.args.gradient_accumulation_steps
+            total_loss.backward()
+            accumulated_total_loss += total_loss.detach().item()
             accumulated_loss += loss.detach().item()
+            accumulated_motion_loss += motion_loss.detach().item()
             requires_gradient_step = True
 
             # 5. Clip gradients
@@ -531,10 +552,12 @@ class SFTTrainer:
                         parallel.dist_max(torch.tensor([accumulated_loss], device=device), dp_cp_mesh),
                     )
                 else:
-                    global_avg_loss = global_max_loss = accumulated_loss
+                    global_avg_loss = global_max_loss = accumulated_total_loss
 
                 logs["global_avg_loss"] = global_avg_loss
                 logs["global_max_loss"] = global_max_loss
+                logs["video_loss"] = loss
+                logs["motion_loss"] = motion_loss
                 train_state.global_avg_losses.append(global_avg_loss)
                 train_state.global_max_losses.append(global_max_loss)
                 accumulated_loss = 0.0
@@ -568,7 +591,7 @@ class SFTTrainer:
             )
 
             # 8. Perform validation if required
-            if train_state.step % self.args.validation_steps == 0:
+            if train_state.step % self.args.validation_steps == 1:
                 self._validate(step=train_state.step, final_validation=False)
 
         # 9. Final checkpoint, validation & cleanup
@@ -744,6 +767,8 @@ class SFTTrainer:
         if not final_validation:
             self._move_components_to_device()
             self.transformer.train()
+            self.just_validated = True
+
 
     def _evaluate(self) -> None:
         raise NotImplementedError("Evaluation has not been implemented yet.")
@@ -828,8 +853,10 @@ class SFTTrainer:
             components = [self.text_encoder, self.text_encoder_2, self.text_encoder_3, self.transformer, self.vae]
         components = utils.get_non_null_items(components)
         components = list(filter(lambda x: hasattr(x, "to"), components))
+        #print(components)
         for component in components:
-            component.to(device)
+            component.to_empty(device=device)
+            component.to(device=device)
 
     def _set_components(self, components: Dict[str, Any]) -> None:
         for component_name in self._all_component_names:
@@ -965,6 +992,7 @@ class SFTTrainer:
             utils._enable_vae_memory_optimizations(self.vae, self.args.enable_slicing, self.args.enable_tiling)
             component_names = list(latent_components.keys())
             component_modules = list(latent_components.values())
+            print("LATENT COMPONENTS: ", component_names)
             self._set_components(latent_components)
             self._move_components_to_device(component_modules)
             latent_iterator = consume_fn(
