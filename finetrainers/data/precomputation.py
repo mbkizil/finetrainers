@@ -70,8 +70,10 @@ class InMemoryDistributedDataPreprocessor(DistributedDataProcessorMixin):
         for i in range(self._num_items):
             if use_cached_samples:
                 item = self._cached_samples[i]
+                print(f"item at processor use_cached_samples: {item}")
             else:
                 item = next(data_iterator)
+                print(f"item at processor else: {item}")
                 if cache_samples:
                     self._cached_samples.append(item)
             item = self._processor_fn[data_type](**item, **components, generator=generator)
@@ -166,15 +168,17 @@ class PrecomputedDistributedDataPreprocessor(DistributedDataProcessorMixin):
                 raise ValueError("Cannot cache and use cached samples at the same time.")
             if drop_samples:
                 raise ValueError("Cannot cache and drop samples at the same time.")
-
         for i in tqdm(range(self._num_items), desc=f"Rank {self._rank}", total=self._num_items):
             if use_cached_samples:
-                item = self._cached_samples[i]
+                item = self._cached_samples[i]               
+
             else:
                 item = next(data_iterator)
+
                 if cache_samples:
                     self._cached_samples.append(item)
             item = self._processor_fn[data_type](**item, **components, generator=generator)
+            print(f"\n\n\nitem at after processor: {item}")
             _save_item(self._rank, i, item, self._save_dir, data_type)
 
         if drop_samples:
