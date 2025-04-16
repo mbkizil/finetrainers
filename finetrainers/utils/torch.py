@@ -120,7 +120,7 @@ def clip_grad_norm_(
     # It has two purposes:
     #   1. to make sure the total norm is computed correctly when PP is used (see below)
     #   2. to return a reduced total_norm tensor whose .item() would return the correct value
-    if isinstance(total_norm, torch.distributed.tensor.DTensor):
+    if False: #isinstance(total_norm, torch.distributed.tensor.DTensor):
         # Will reach here if any non-PP parallelism is used.
         # If only using PP, total_norm will be a local tensor.
         total_norm = total_norm.full_tensor()
@@ -215,12 +215,19 @@ def get_string_from_dtype(dtype: torch.dtype):
     return _DTYPE_TO_STRING[dtype]
 
 
-def set_requires_grad(models: Union[torch.nn.Module, List[torch.nn.Module]], value: bool) -> None:
+def set_requires_grad(models: Union[torch.nn.Module, List[torch.nn.Module]], value: bool, phase: Optional[str]) -> None:
     if isinstance(models, torch.nn.Module):
         models = [models]
+
     for model in models:
         if model is not None:
-            model.requires_grad_(value)
+            if phase is not None:
+                print(f"Setting requires_grad for {phase} to {value}")
+                model.requires_grad_(not value)
+                model.dual_proj_out.requires_grad_(value)
+                model.proj_out.requires_grad_(value)
+            else:
+                model.requires_grad_(value)
 
 
 def synchronize_device() -> None:

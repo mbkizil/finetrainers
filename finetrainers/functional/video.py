@@ -76,8 +76,8 @@ def resize_to_nearest_bucket_video(
     _first_frame_only = False
     if num_frames > target_frames:
         # Downsample: Select frames evenly
-        indices = torch.linspace(0, num_frames - 1, target_frames).long()
-        video = video[indices, :, :, :]
+        #indices = torch.linspace(0, num_frames - 1, target_frames).long()
+        video = video[:target_frames, :, :, :]
     elif num_frames < target_frames:
         _first_frame_only = False
 

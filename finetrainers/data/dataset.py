@@ -268,14 +268,13 @@ class ImageFileCaptionFileListDataset(
     def state_dict(self):
         return {"sample_index": self._sample_index}
 
-
 class VideoFileCaptionFileListDataset(
     torch.utils.data.IterableDataset, torch.distributed.checkpoint.stateful.Stateful
 ):
     def __init__(self, root: str, infinite: bool = False) -> None:
         super().__init__()
 
-        VALID_CAPTION_FILES = ["caption.txt", "captions.txt", "prompt.txt", "prompts.txt"]
+        VALID_CAPTION_FILES = ["prompt.txt", "prompts.txt", "caption.txt", "captions.txt"]
         VALID_VIDEO_FILES = ["video.txt", "videos.txt"]
 
         self.root = pathlib.Path(root)
@@ -304,18 +303,19 @@ class VideoFileCaptionFileListDataset(
 
         caption_file = existing_caption_files[0]
         video_file = existing_video_files[0]
-
         with open((self.root / caption_file).as_posix(), "r") as f:
             captions = f.read().splitlines()
         with open((self.root / video_file).as_posix(), "r") as f:
             videos = f.read().splitlines()
             videos = [(self.root / video).as_posix() for video in videos]
+            optical_flows = [(self.root / video.replace(".mp4", "_flows/optical_flows")).as_posix() for video in videos]
+            #print(videos[0], optical_flows[0])
 
         if len(captions) != len(videos):
             raise ValueError(f"Number of captions ({len(captions)}) must match number of videos ({len(videos)})")
 
-        for caption, video in zip(captions, videos):
-            data.append({"caption": caption, "video": video})
+        for caption, video, optical_flow in zip(captions, videos, optical_flows):
+            data.append({"caption": caption, "video": video, "optical_flow": optical_flow})
 
         data = datasets.Dataset.from_list(data)
         data = data.cast_column("video", datasets.Video())
@@ -334,6 +334,11 @@ class VideoFileCaptionFileListDataset(
             for sample in self._get_data_iter():
                 self._sample_index += 1
                 sample["video"] = _preprocess_video(sample["video"])
+                sample["optical_flow"] = _load_optical_flows(sample["optical_flow"]) 
+                if sample["optical_flow"] is None:
+                    _ = sample.pop("optical_flow")
+                print("\n\shapes")
+                print(sample["video"].shape, sample["optical_flow"].shape)
                 yield sample
 
             if not self.infinite:
@@ -348,6 +353,23 @@ class VideoFileCaptionFileListDataset(
     def state_dict(self):
         return {"sample_index": self._sample_index}
 
+def _load_optical_flows(flow_folder_path: str) -> Optional[torch.Tensor]:
+    flow_folder = pathlib.Path(flow_folder_path)
+    if not flow_folder.exists():
+        logger.warning(f"Optical flow folder not found: {flow_folder}")
+        return None
+
+    frames = []
+    for i in range(49):  # 0.jpg to 50.jpg
+        path = flow_folder /  f"{i:05d}.jpg"
+        image = PIL.Image.open(path).convert("RGB")
+        tensor = _preprocess_image(image)  # shape [3, H, W]
+        frames.append(tensor)
+
+    if len(frames) == 0:
+        logger.warning(f"No optical flow frames found in {flow_folder}")
+        return None
+    return torch.stack(frames)  # shape [N, 3, H, W]
 
 class ImageFolderDataset(torch.utils.data.IterableDataset, torch.distributed.checkpoint.stateful.Stateful):
     def __init__(self, root: str, infinite: bool = False) -> None:
@@ -720,6 +742,9 @@ class IterableDatasetPreprocessingWrapper(
                     sample["video"], _first_frame_only = FF.resize_to_nearest_bucket_video(
                         sample["video"], self.video_resolution_buckets, self.reshape_mode
                     )
+                    sample["optical_flow"], _ = FF.resize_to_nearest_bucket_video(
+                        sample["optical_flow"], self.video_resolution_buckets, self.reshape_mode
+                    )
                     if _first_frame_only:
                         msg = (
                             "The number of frames in the video is less than the minimum bucket size "
@@ -729,6 +754,9 @@ class IterableDatasetPreprocessingWrapper(
                         )
                         logger.log_freq("WARNING", "BUCKET_TEMPORAL_SIZE_UNAVAILABLE", msg, frequency=128)
                         sample["video"] = sample["video"][0]
+                    #sample["video"] = sample["optical_flow"]
+                    #sample.pop("optical_flow")
+                    print("\nsample keys: ",sample.keys())
 
             if self.remove_common_llm_caption_prefixes:
                 sample["caption"] = FF.remove_prefix(sample["caption"], constants.COMMON_LLM_START_PHRASES)

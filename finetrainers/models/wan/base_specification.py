@@ -7,9 +7,10 @@ from diffusers import (
     AutoencoderKLWan,
     FlowMatchEulerDiscreteScheduler,
     WanImageToVideoPipeline,
-    WanPipeline,
     WanTransformer3DModel,
 )
+from .transformerMotion import WanTransformer3DModelMotion
+from .pipelineMotion import WanPipeline
 from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
 from PIL.Image import Image
 from transformers import AutoModel, AutoTokenizer, UMT5EncoderModel
@@ -25,6 +26,10 @@ from finetrainers.utils import get_non_null_items
 
 logger = get_logger()
 
+def get_psnr(video, recon):
+    mse = torch.mean((video - recon) ** 2)
+    psnr = 10 * torch.log10(1.0 / mse)
+    return psnr
 
 class WanLatentEncodeProcessor(ProcessorMixin):
     r"""
@@ -47,10 +52,12 @@ class WanLatentEncodeProcessor(ProcessorMixin):
         image: Optional[torch.Tensor] = None,
         video: Optional[torch.Tensor] = None,
         generator: Optional[torch.Generator] = None,
+        optical_flow: Optional[torch.Tensor] = None,
         compute_posterior: bool = True,
     ) -> Dict[str, torch.Tensor]:
         device = vae.device
-        dtype = vae.dtype
+        dtype = vae.dtype  
+        compute_posterior = False
 
         if image is not None:
             video = image.unsqueeze(1)
@@ -58,6 +65,8 @@ class WanLatentEncodeProcessor(ProcessorMixin):
         assert video.ndim == 5, f"Expected 5D tensor, got {video.ndim}D tensor"
         video = video.to(device=device, dtype=vae.dtype)
         video = video.permute(0, 2, 1, 3, 4).contiguous()  # [B, F, C, H, W] -> [B, C, F, H, W]
+        latents_mean = torch.tensor(vae.config.latents_mean)
+        latents_std = 1.0 / torch.tensor(vae.config.latents_std)
 
         if compute_posterior:
             latents = vae.encode(video).latent_dist.sample(generator=generator)
@@ -71,11 +80,34 @@ class WanLatentEncodeProcessor(ProcessorMixin):
             #     moments = vae._encode(video)
             moments = vae._encode(video)
             latents = moments.to(dtype=dtype)
+            
 
-        latents_mean = torch.tensor(vae.config.latents_mean)
-        latents_std = 1.0 / torch.tensor(vae.config.latents_std)
+
+        if optical_flow is not None:
+            optical_flow = optical_flow.to(device=device, dtype=vae.dtype)
+            optical_flow = optical_flow.permute(0, 2, 1, 3, 4).contiguous()  # [B, F, C, H, W] -> [B, C, F, H, W]
+            print("optical_flow.shape before encoder", optical_flow.shape)
+            optical_moments = vae._encode(optical_flow)
+            optical_latents = optical_moments.to(dtype=dtype)
+
+
+            return {
+                self.output_names[0]: latents,
+                self.output_names[1]: latents_mean,
+                self.output_names[2]: latents_std,
+                "motion_latents": optical_latents,
+            }
 
         return {self.output_names[0]: latents, self.output_names[1]: latents_mean, self.output_names[2]: latents_std}
+    
+    @staticmethod
+    def _normalize_latents(
+        latents: torch.Tensor, latents_mean: torch.Tensor, latents_std: torch.Tensor
+    ) -> torch.Tensor:
+        latents_mean = latents_mean.view(1, -1, 1, 1, 1).to(device=latents.device)
+        latents_std = latents_std.view(1, -1, 1, 1, 1).to(device=latents.device)
+        latents = ((latents.float() - latents_mean) * latents_std).to(latents)
+        return latents
 
 
 class WanModelSpecification(ModelSpecification):
@@ -160,26 +192,32 @@ class WanModelSpecification(ModelSpecification):
         common_kwargs = {"revision": self.revision, "cache_dir": self.cache_dir}
 
         if self.transformer_id is not None:
-            transformer = WanTransformer3DModel.from_pretrained(
+            base_transformer = WanTransformer3DModel.from_pretrained(
                 self.transformer_id, torch_dtype=self.transformer_dtype, **common_kwargs
             )
         else:
-            transformer = WanTransformer3DModel.from_pretrained(
+            base_transformer = WanTransformer3DModel.from_pretrained(
                 self.pretrained_model_name_or_path,
                 subfolder="transformer",
                 torch_dtype=self.transformer_dtype,
                 **common_kwargs,
             )
 
+        
+        transformer = WanTransformer3DModelMotion.from_config(base_transformer.config)
+        missing_keys, unexpected_keys = transformer.load_state_dict(state_dict=base_transformer.state_dict(), strict=False)
+        transformer.to(self.transformer_dtype)
         scheduler = FlowMatchEulerDiscreteScheduler()
-
+        print(
+            f"Missing keys in transformer: {missing_keys}, unexpected keys in transformer: {unexpected_keys}"
+        )
         return {"transformer": transformer, "scheduler": scheduler}
 
     def load_pipeline(
         self,
         tokenizer: Optional[AutoTokenizer] = None,
         text_encoder: Optional[UMT5EncoderModel] = None,
-        transformer: Optional[WanTransformer3DModel] = None,
+        transformer: Optional[WanTransformer3DModelMotion] = None,
         vae: Optional[AutoencoderKLWan] = None,
         scheduler: Optional[FlowMatchEulerDiscreteScheduler] = None,
         enable_slicing: bool = False,
@@ -266,7 +304,7 @@ class WanModelSpecification(ModelSpecification):
 
     def forward(
         self,
-        transformer: WanTransformer3DModel,
+        transformer: WanTransformer3DModelMotion,
         condition_model_conditions: Dict[str, torch.Tensor],
         latent_model_conditions: Dict[str, torch.Tensor],
         sigmas: torch.Tensor,
@@ -281,30 +319,70 @@ class WanModelSpecification(ModelSpecification):
             latents = latent_model_conditions.pop("latents")
             latents_mean = latent_model_conditions.pop("latents_mean")
             latents_std = latent_model_conditions.pop("latents_std")
+        
 
             mu, logvar = torch.chunk(latents, 2, dim=1)
+            with open('rgb_latent_norm_params.csv', 'a') as f:
+                f.write(f"{mu.mean(dim=[0, 2, 3, 4]).float().cpu().numpy().tolist()},{logvar.mean(dim=[0, 2, 3, 4]).float().cpu().numpy().tolist()}\n")
             mu = self._normalize_latents(mu, latents_mean, latents_std)
             logvar = self._normalize_latents(logvar, latents_mean, latents_std)
+            with open('rgb_latent_norm_after.csv', 'a') as f:
+                f.write(f"{mu.mean(dim=[0, 2, 3, 4]).float().cpu().numpy().tolist()},{logvar.mean(dim=[0, 2, 3, 4]).float().cpu().numpy().tolist()}\n")
             latents = torch.cat([mu, logvar], dim=1)
 
             posterior = DiagonalGaussianDistribution(latents)
             latents = posterior.sample(generator=generator)
             del posterior
+            noise = torch.zeros_like(latents).normal_(generator=generator)
 
-        noise = torch.zeros_like(latents).normal_(generator=generator)
+            if "motion_latents" in latent_model_conditions.keys():
+                motion_latents = latent_model_conditions.pop("motion_latents")
+                motion_latents_mean = [3.5426307091346154, 0.9559420072115384, 3.0486778846153846, 4.001727764423077, -0.3437300461989183, 0.3511645977313702, -2.2886868990384617, 0.1665320763221154, -4.4130108173076925, -1.741943359375, 3.765324519230769, 0.4672429011418269, -2.443058894230769, -0.8411002984413734, 5.263146033653846, 2.435847355769231]
+                motion_latents_std = [-18.259615384615383, -18.161057692307693, -18.651442307692307, -17.920673076923077, -17.518028846153847, -18.15985576923077, -18.248798076923077, -18.35576923076923, -17.907451923076923, -17.556490384615383, -18.294471153846153, -18.21514423076923, -17.931490384615383, -17.63701923076923, -18.216346153846153, -18.596153846153847]
+                motion_latents_mean = torch.tensor(motion_latents_mean).to(device=latents.device)
+                motion_latents_std = 1.0 / torch.tensor(motion_latents_std).to(device=latents.device)
+
+                motion_mu, motion_logvar = torch.chunk(motion_latents, 2, dim=1)
+                with open('motion_latent_norm_params.csv', 'a') as f:
+                    f.write(f"{motion_mu.mean(dim=[0, 2, 3, 4]).float().cpu().numpy().tolist()},{motion_logvar.mean(dim=[0, 2, 3, 4]).float().cpu().numpy().tolist()}\n")
+                motion_mu = self._normalize_latents(motion_mu, motion_latents_mean, motion_latents_std)
+                motion_logvar = self._normalize_latents(motion_logvar, motion_latents_mean, motion_latents_std)
+                with open('motion_latent_norm_after.csv', 'a') as f:
+                    f.write(f"{motion_mu.mean(dim=[0, 2, 3, 4]).float().cpu().numpy().tolist()},{motion_logvar.mean(dim=[0, 2, 3, 4]).float().cpu().numpy().tolist()}\n")
+                motion_latents = torch.cat([motion_mu, motion_logvar], dim=1)
+
+                posterior = DiagonalGaussianDistribution(motion_latents)
+                motion_latents = posterior.sample(generator=generator)
+                del posterior
+
+                motion_noisy_latents = FF.flow_match_xt(motion_latents, noise, sigmas)
+                latent_model_conditions["motion_latents"] = motion_noisy_latents.to(motion_latents)
+
         noisy_latents = FF.flow_match_xt(latents, noise, sigmas)
         timesteps = (sigmas.flatten() * 1000.0).long()
 
         latent_model_conditions["hidden_states"] = noisy_latents.to(latents)
 
-        pred = transformer(
-            **latent_model_conditions,
-            **condition_model_conditions,
-            timestep=timesteps,
-            return_dict=False,
-        )[0]
-        target = FF.flow_match_target(noise, latents)
 
+        if "motion_latents" in latent_model_conditions.keys():
+            pred, motion_pred = transformer(
+                **latent_model_conditions,
+                **condition_model_conditions,
+                timestep=timesteps,
+                return_dict=False,
+            )
+        else:
+            pred = transformer(
+                **latent_model_conditions,
+                **condition_model_conditions,
+                timestep=timesteps,
+                return_dict=False,
+            )
+        target = FF.flow_match_target(noise, latents)
+        if "motion_latents" in latent_model_conditions.keys():
+            motion_target = FF.flow_match_target(noise, motion_latents)
+
+            return pred, target, sigmas, motion_pred, motion_target
         return pred, target, sigmas
 
     def validation(
@@ -330,12 +408,25 @@ class WanModelSpecification(ModelSpecification):
             "num_frames": num_frames,
             "num_inference_steps": num_inference_steps,
             "generator": generator,
-            "return_dict": True,
-            "output_type": "pil",
+            "return_dict": False,
+            "output_type": "np",
         }
         generation_kwargs = get_non_null_items(generation_kwargs)
-        video = pipeline(**generation_kwargs).frames[0]
-        return [VideoArtifact(value=video)]
+        try:
+            video, optical_video = pipeline(**generation_kwargs)
+            video = video[0]
+            optical_video = optical_video[0]
+            print("Video generated shape", video.shape)
+            print("Optical video generated shape", optical_video.shape)
+            video = [video[i] for i in range(video.shape[0])]
+            optical_video = [optical_video[i] for i in range(optical_video.shape[0])]
+            return [VideoArtifact(value=video), VideoArtifact(value=optical_video)]
+        except:
+            video = pipeline(**generation_kwargs)
+            video = video[0]
+            print("Video generated shape", video.shape)
+            video = [video[i] for i in range(video.shape[0])]
+            return [VideoArtifact(value=video)]
 
     def _save_lora_weights(
         self,
@@ -354,14 +445,14 @@ class WanModelSpecification(ModelSpecification):
     def _save_model(
         self,
         directory: str,
-        transformer: WanTransformer3DModel,
+        transformer: WanTransformer3DModelMotion,
         transformer_state_dict: Optional[Dict[str, torch.Tensor]] = None,
         scheduler: Optional[SchedulerType] = None,
     ) -> None:
         # TODO(aryan): this needs refactoring
         if transformer_state_dict is not None:
             with init_empty_weights():
-                transformer_copy = WanTransformer3DModel.from_config(transformer.config)
+                transformer_copy = WanTransformer3DModelMotion.from_config(transformer.config)
             transformer_copy.load_state_dict(transformer_state_dict, strict=True, assign=True)
             transformer_copy.save_pretrained(os.path.join(directory, "transformer"))
         if scheduler is not None:

@@ -15,11 +15,11 @@ BACKEND="ptd"
 
 # In this setting, I'm using 2 GPUs on a 4-GPU node for training
 NUM_GPUS=1
-CUDA_VISIBLE_DEVICES="1"
+CUDA_VISIBLE_DEVICES="3"
 
 # Check the JSON files for the expected JSON format
-TRAINING_DATASET_CONFIG="examples/training/sft/wan/crush_smol_lora/training.json"
-VALIDATION_DATASET_FILE="examples/training/sft/wan/crush_smol_lora/validation.json"
+TRAINING_DATASET_CONFIG="examples/training/sft/wan/k400/training.json"
+VALIDATION_DATASET_FILE="examples/training/sft/wan/k400/validation.json"
 
 # Depending on how many GPUs you have available, choose your degree of parallelism and technique!
 DDP_1="--parallel_backend $BACKEND --pp_degree 1 --dp_degree 1 --dp_shards 1 --cp_degree 1 --tp_degree 1"
@@ -48,10 +48,10 @@ model_cmd=(
 # (which is something we've to improve [TODO(aryan)])
 dataset_cmd=(
   --dataset_config $TRAINING_DATASET_CONFIG
-  --dataset_shuffle_buffer_size 10
-  --enable_precomputation
-  --precomputation_items 25
-  --precomputation_once
+  #--dataset_shuffle_buffer_size 10
+  #--enable_precomputation
+  #--precomputation_items 15
+  #--precomputation_once
 )
 
 # Dataloader arguments
@@ -68,14 +68,12 @@ diffusion_cmd=(
 # We target just the attention projections layers for LoRA training here.
 # You can modify as you please and target any layer (regex is supported)
 training_cmd=(
-  --training_type "lora"
+  --training_type "full-finetune"
   --seed 42
   --batch_size 1
   --train_steps 3000
-  --rank 32
-  --lora_alpha 32
   --target_modules "blocks.*(to_q|to_k|to_v|to_out.0)"
-  --gradient_accumulation_steps 1
+  --gradient_accumulation_steps 2
   --gradient_checkpointing
   --checkpointing_steps 500
   --checkpointing_limit 2

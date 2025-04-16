@@ -20,10 +20,15 @@ from huggingface_hub import create_repo, upload_folder
 from peft import LoraConfig, get_peft_model_state_dict
 from tqdm import tqdm
 
+from finetrainers.models.utils import DiagonalGaussianDistribution
+
+# Constants for configuration
+PRE_TRAIN_STEPS = 1000
+DEFAULT_EXPORT_FPS = 30
 from finetrainers import data, logging, optimizer, parallel, patches, utils
 from finetrainers.config import TrainingType
 from finetrainers.state import State, TrainState
-
+from finetrainers.models.wan.transformerMotion import WanTransformer3DModelMotion
 
 if TYPE_CHECKING:
     from finetrainers.args import BaseArgs
@@ -82,11 +87,15 @@ class SFTTrainer:
         self.model_specification = model_specification
         self._are_condition_models_loaded = False
 
+        self.check_vae = False
+
     def run(self) -> None:
+
+
         try:
             self._prepare_models()
-            self._prepare_trainable_parameters()
-            self._prepare_for_training()
+            self._prepare_trainable_parameters('initial')
+            self._prepare_for_training('initial')
             self._prepare_dataset()
             self._prepare_checkpointing()
             self._train()
@@ -107,14 +116,14 @@ class SFTTrainer:
                 "Pipeline parallelism is not supported yet. This will be supported in the future."
             )
 
-    def _prepare_trainable_parameters(self) -> None:
+    def _prepare_trainable_parameters(self, phase: Optional[str]) -> None:
         logger.info("Initializing trainable parameters")
 
         parallel_backend = self.state.parallel_backend
 
         if self.args.training_type == TrainingType.FULL_FINETUNE:
             logger.info("Finetuning transformer with no additional parameters")
-            utils.set_requires_grad([self.transformer], True)
+            utils.set_requires_grad([self.transformer], True, phase)
         else:
             logger.info("Finetuning transformer with PEFT parameters")
             utils.set_requires_grad([self.transformer], False)
@@ -153,7 +162,7 @@ class SFTTrainer:
             if self.args.training_type == TrainingType.LORA:
                 cast_training_params([self.transformer], dtype=torch.float32)
 
-    def _prepare_for_training(self) -> None:
+    def _prepare_for_training(self, phase: Optional[str] = None) -> None:
         # 1. Apply parallelism
         parallel_backend = self.state.parallel_backend
         model_specification = self.model_specification
@@ -214,41 +223,7 @@ class SFTTrainer:
 
         self._move_components_to_device()
 
-        # 2. Prepare optimizer and lr scheduler
-        # For training LoRAs, we can be a little more optimal. Currently, the OptimizerWrapper only accepts torch::nn::Module.
-        # This causes us to loop over all the parameters (even ones that don't require gradients, as in LoRA) at each optimizer
-        # step. This is OK (see https://github.com/pytorch/pytorch/blob/2f40f789dafeaa62c4e4b90dbf4a900ff6da2ca4/torch/optim/sgd.py#L85-L99)
-        # but can be optimized a bit by maybe creating a simple wrapper module encompassing the actual parameters that require
-        # gradients. TODO(aryan): look into it in the future.
-        model_parts = [self.transformer]
-        self.state.num_trainable_parameters = sum(
-            p.numel() for m in model_parts for p in m.parameters() if p.requires_grad
-        )
-
-        # Setup distributed optimizer and lr scheduler
-        logger.info("Initializing optimizer and lr scheduler")
-        self.state.train_state = TrainState()
-        self.optimizer = optimizer.get_optimizer(
-            parallel_backend=self.args.parallel_backend,
-            name=self.args.optimizer,
-            model_parts=model_parts,
-            learning_rate=self.args.lr,
-            beta1=self.args.beta1,
-            beta2=self.args.beta2,
-            beta3=self.args.beta3,
-            epsilon=self.args.epsilon,
-            weight_decay=self.args.weight_decay,
-            fused=False,
-        )
-        self.lr_scheduler = optimizer.get_lr_scheduler(
-            parallel_backend=self.args.parallel_backend,
-            name=self.args.lr_scheduler,
-            optimizer=self.optimizer,
-            num_warmup_steps=self.args.lr_warmup_steps,
-            num_training_steps=self.args.train_steps,
-            # TODO(aryan): handle last_epoch
-        )
-        self.optimizer, self.lr_scheduler = parallel_backend.prepare_optimizer(self.optimizer, self.lr_scheduler)
+        self._setup_optimizer_and_scheduler(phase)
 
         # 3. Initialize trackers, directories and repositories
         self._init_logging()
@@ -331,6 +306,7 @@ class SFTTrainer:
 
     def _train(self) -> None:
         logger.info("Starting training")
+        wandb.init(project="WAN-AI")
 
         parallel_backend = self.state.parallel_backend
         train_state = self.state.train_state
@@ -404,12 +380,17 @@ class SFTTrainer:
             batch_size=self.args.batch_size, dim_keys=self.model_specification._resolution_dim_keys
         )
         requires_gradient_step = True
+        accumulated_total_loss = 0.0
         accumulated_loss = 0.0
-
+        accumulated_motion_loss = 0.0
         while (
             train_state.step < self.args.train_steps and train_state.observed_data_samples < self.args.max_data_samples
         ):
             # 1. Load & preprocess data if required
+            if train_state.step == PRE_TRAIN_STEPS:
+                self._prepare_trainable_parameters(None)
+                self._prepare_for_training()
+
             if preprocessor.requires_data:
                 # TODO(aryan): We should do the following here:
                 # - Force checkpoint the trainable models, optimizers, schedulers and train state
@@ -455,6 +436,8 @@ class SFTTrainer:
             latent_model_conditions = utils.make_contiguous(latent_model_conditions)
             condition_model_conditions = utils.make_contiguous(condition_model_conditions)
 
+
+
             # 3. Forward pass
             sigmas = utils.prepare_sigmas(
                 scheduler=self.scheduler,
@@ -469,15 +452,29 @@ class SFTTrainer:
                 generator=self.state.generator,
             )
             sigmas = utils.expand_tensor_dims(sigmas, latent_model_conditions["latents"].ndim)
+            motion_pred = None
+            print("latent model conditions:", latent_model_conditions.keys())
+            if "motion_latents" in latent_model_conditions.keys():
+                pred, target, sigmas, motion_pred, motion_target = self.model_specification.forward(
+                    transformer=self.transformer,
+                    scheduler=self.scheduler,
+                    condition_model_conditions=condition_model_conditions,
+                    latent_model_conditions=latent_model_conditions,
+                    sigmas=sigmas,
+                    compute_posterior=not self.args.precomputation_once,
+                )
+            else:
+                pred, target, sigmas = self.model_specification.forward(
+                    transformer=self.transformer,
+                    scheduler=self.scheduler,
+                    condition_model_conditions=condition_model_conditions,
+                    latent_model_conditions=latent_model_conditions,
+                    sigmas=sigmas,
+                    compute_posterior=not self.args.precomputation_once,
+                )
+                print("pred shape:", pred.shape)
+                print("target shape:", target.shape)
 
-            pred, target, sigmas = self.model_specification.forward(
-                transformer=self.transformer,
-                scheduler=self.scheduler,
-                condition_model_conditions=condition_model_conditions,
-                latent_model_conditions=latent_model_conditions,
-                sigmas=sigmas,
-                compute_posterior=not self.args.precomputation_once,
-            )
 
             timesteps = (sigmas * 1000.0).long()
             weights = utils.prepare_loss_weights(
@@ -488,16 +485,30 @@ class SFTTrainer:
             )
             weights = utils.expand_tensor_dims(weights, pred.ndim)
 
+
             # 4. Compute loss & backward pass
             loss = weights.float() * (pred.float() - target.float()).pow(2)
+            if motion_pred is not None:
+                motion_loss = weights.float() * (motion_pred.float() - motion_target.float()).pow(2)
+                motion_loss = motion_loss.mean(list(range(1, motion_loss.ndim)))
+                motion_loss = motion_loss.mean()
+
             # Average loss across all but batch dimension
             loss = loss.mean(list(range(1, loss.ndim)))
             # Average loss across batch dimension
             loss = loss.mean()
+
+            if motion_pred is not None:
+                total_loss = loss + motion_loss
+            else:
+                total_loss = loss
+                motion_loss = torch.tensor(0.0, device=device)
             if self.args.gradient_accumulation_steps > 1:
-                loss = loss / self.args.gradient_accumulation_steps
-            loss.backward()
+                total_loss = total_loss / self.args.gradient_accumulation_steps
+            total_loss.backward()
+            accumulated_total_loss += total_loss.detach().item()
             accumulated_loss += loss.detach().item()
+            accumulated_motion_loss += motion_loss.detach().item()
             requires_gradient_step = True
 
             # 5. Clip gradients
@@ -531,13 +542,17 @@ class SFTTrainer:
                         parallel.dist_max(torch.tensor([accumulated_loss], device=device), dp_cp_mesh),
                     )
                 else:
-                    global_avg_loss = global_max_loss = accumulated_loss
+                    global_avg_loss = global_max_loss = accumulated_total_loss
 
                 logs["global_avg_loss"] = global_avg_loss
                 logs["global_max_loss"] = global_max_loss
+                logs["video_loss"] = loss
+                logs["motion_loss"] = motion_loss
                 train_state.global_avg_losses.append(global_avg_loss)
                 train_state.global_max_losses.append(global_max_loss)
                 accumulated_loss = 0.0
+                accumulated_motion_loss = 0.0
+                accumulated_total_loss = 0.0
                 requires_gradient_step = False
 
             progress_bar.update(1)
@@ -545,7 +560,7 @@ class SFTTrainer:
 
             timesteps_buffer.extend([(train_state.step, t) for t in timesteps.detach().cpu().numpy().tolist()])
 
-            if train_state.step % self.args.logging_steps == 0:
+            if train_state.step % 1 == 0:
                 # TODO(aryan): handle non-SchedulerWrapper schedulers (probably not required eventually) since they might not be dicts
                 # TODO(aryan): causes NCCL hang for some reason. look into later
                 # logs.update(self.lr_scheduler.get_last_lr())
@@ -568,7 +583,7 @@ class SFTTrainer:
             )
 
             # 8. Perform validation if required
-            if train_state.step % self.args.validation_steps == 0:
+            if train_state.step % 50 == 0:
                 self._validate(step=train_state.step, final_validation=False)
 
         # 9. Final checkpoint, validation & cleanup
@@ -653,7 +668,7 @@ class SFTTrainer:
             PROMPT = validation_data["prompt"]
             IMAGE = validation_data.get("image", None)
             VIDEO = validation_data.get("video", None)
-            EXPORT_FPS = validation_data.get("export_fps", 30)
+            EXPORT_FPS = validation_data.get("export_fps", DEFAULT_EXPORT_FPS)
 
             # 2.1. If there are any initial images or videos, they will be logged to keep track of them as
             # conditioning for generation.
@@ -673,7 +688,7 @@ class SFTTrainer:
             # TODO(aryan): Currently, we only support WandB so we've hardcoded it here. Needs to be revisited.
             for index, (key, artifact) in enumerate(list(artifacts.items())):
                 assert isinstance(artifact, (data.ImageArtifact, data.VideoArtifact))
-
+                print(key)
                 time_, rank, ext = int(time.time()), parallel_backend.rank, artifact.file_extension
                 filename = "validation-" if not final_validation else "final-"
                 filename += f"{step}-{rank}-{index}-{prompt_filename}-{time_}.{ext}"
@@ -829,7 +844,10 @@ class SFTTrainer:
         components = utils.get_non_null_items(components)
         components = list(filter(lambda x: hasattr(x, "to"), components))
         for component in components:
-            component.to(device)
+            if any(p.device.type == "meta" for p in component.parameters()):
+                component.to_empty(device=device)
+            else:
+                component.to(device)
 
     def _set_components(self, components: Dict[str, Any]) -> None:
         for component_name in self._all_component_names:
@@ -872,7 +890,14 @@ class SFTTrainer:
             # Load the transformer weights from the final checkpoint if performing full-finetune
             transformer = None
             if self.args.training_type == TrainingType.FULL_FINETUNE:
-                transformer = self.model_specification.load_diffusion_models()["transformer"]
+                print("\n\n\n-----------\n\n\n")
+                base_transformer = self.model_specification.load_diffusion_models()["transformer"]
+                transformer = WanTransformer3DModelMotion.from_config(base_transformer.config)
+                state_dict = base_transformer.state_dict()
+                missing_keys, unexpected_keys = transformer.load_state_dict(state_dict, strict=False)
+
+                print("Missing keys in pretrained (new params):", missing_keys)
+                print("Unexpected keys (present in state_dict but not in new model):", unexpected_keys)
 
             pipeline = self.model_specification.load_pipeline(
                 transformer=transformer,
@@ -996,3 +1021,38 @@ class SFTTrainer:
 
         info.update({"diffusion_arguments": filtered_diffusion_args})
         return info
+
+    def _setup_optimizer_and_scheduler(self, phase: Optional[str]) -> None:
+        model_parts = [self.transformer]
+        self.state.num_trainable_parameters = sum(
+            p.numel() for m in model_parts for p in m.parameters() if p.requires_grad
+        )
+        logger.info("Initializing optimizer and lr scheduler")
+        self.state.train_state = TrainState()
+        if phase is None:
+            lr = self.args.lr
+            scheduler_name = self.args.lr_scheduler
+        else:
+            lr = self.args.lr * 50
+            scheduler_name = "constant"
+
+        self.optimizer = optimizer.get_optimizer(
+            parallel_backend=self.args.parallel_backend,
+            name=self.args.optimizer,
+            model_parts=model_parts,
+            learning_rate=lr,
+            beta1=self.args.beta1,
+            beta2=self.args.beta2,
+            beta3=self.args.beta3,
+            epsilon=self.args.epsilon,
+            weight_decay=self.args.weight_decay,
+            fused=False,
+        )
+        self.lr_scheduler = optimizer.get_lr_scheduler(
+            parallel_backend=self.args.parallel_backend,
+            name=scheduler_name,
+            optimizer=self.optimizer,
+            num_warmup_steps=self.args.lr_warmup_steps,
+            num_training_steps=self.args.train_steps,
+        )
+        self.optimizer, self.lr_scheduler = self.state.parallel_backend.prepare_optimizer(self.optimizer, self.lr_scheduler)
